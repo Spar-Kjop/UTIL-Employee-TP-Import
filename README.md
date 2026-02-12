@@ -5,12 +5,16 @@ Polls a SharePoint folder for CSV files containing employee salary data, validat
 ## SharePoint Folder Structure
 
 ```
-Lnn/Automatisering/Import/TimePlan Lønnssats/
-├── <incoming CSV files>      ← script picks these up
-├── Behandlet/                ← successfully processed files go here
-│   └── DD-MM-YYYY HH.MM.SS/ ← timestamped subfolder per file
-└── Feil/                     ← failed files + error logs go here
-    └── DD-MM-YYYY HH.MM.SS/ ← timestamped subfolder per failure
+SharePoint site: Sparfile
+Document library (drive): Lønn
+
+Lønn/
+└── Automatisering/Import/TimePlan Lønnssats/
+    ├── <incoming CSV files>      ← script picks these up
+    ├── Behandlet/                ← successfully processed files go here
+    │   └── DD-MM-YYYY HH.MM.SS/ ← timestamped subfolder per file
+    └── Feil/                     ← failed files + error logs go here
+        └── DD-MM-YYYY HH.MM.SS/ ← timestamped subfolder per failure
 ```
 
 ## What the Script Does
@@ -34,7 +38,7 @@ Lnn/Automatisering/Import/TimePlan Lønnssats/
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.14+
 - An Azure AD **App Registration** with `Sites.ReadWrite.All` application permission (Graph API).
 - SFTP server credentials.
 
@@ -42,8 +46,8 @@ Lnn/Automatisering/Import/TimePlan Lønnssats/
 
 ```bash
 # Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate
+python3.14 -m venv venv
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -62,7 +66,8 @@ cp .env.example .env
 | `AZURE_CLIENT_SECRET` | App registration client secret |
 | `SHAREPOINT_HOSTNAME` | SharePoint hostname (default: `sparkjop.sharepoint.com`) |
 | `SHAREPOINT_SITE_NAME` | SharePoint site name (default: `Sparfile`) |
-| `SHAREPOINT_FOLDER_PATH` | Path within the document library (default: `Lnn/Automatisering/Import/TimePlan Lønnssats`) |
+| `SHAREPOINT_DRIVE_NAME` | Document library / drive name (default: `Lønn`) |
+| `SHAREPOINT_FOLDER_PATH` | Path within the document library (default: `Automatisering/Import/TimePlan Lønnssats`) |
 | `SFTP_HOST` | SFTP server hostname |
 | `SFTP_PORT` | SFTP server port (default: `22`) |
 | `SFTP_USERNAME` | SFTP username |
