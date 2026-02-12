@@ -1,0 +1,4 @@
+msal>=1.28.0
+requests>=2.31.0
+paramiko>=3.4.0
+python-dotenv>=1.0.0
