@@ -4,9 +4,9 @@ UTIL-Employee-TP-Import
 Polls a SharePoint folder for CSV files, validates & transforms them,
 uploads the result to an SFTP server, and archives the originals.
 
-SharePoint path : Lnn/Automatisering/Import/TimePlan Lønnssats
+SharePoint path : Lønn / Automatisering/Import/TimePlan Lønnssats
 Ignored folders : Behandlet, Feil
-Output file     : TimeplanEmployeeIntegrationOutput.csv
+Output file     : TimeplanEmployeeIntegrationOutput.txt
 SFTP destination: /Import til TP
 """
 
@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import msal
 import paramiko
@@ -53,7 +54,7 @@ EXPECTED_COLUMNS = [
     "MONTHLYSALARY",
     "SOCIALSECURITYNUM",
 ]
-OUTPUT_FILENAME = "TimeplanEmployeeIntegrationOutput.csv"
+OUTPUT_FILENAME = "TimeplanEmployeeIntegrationOutput.txt"
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -185,13 +186,44 @@ def delete_file(token: str, drive_id: str, item_id: str) -> None:
 # ──────────────────────────────────────────────
 # CSV validation & transformation
 # ──────────────────────────────────────────────
-def validate_csv(raw: bytes, filename: str) -> list[dict]:
-    """
-    Validate that the CSV has the expected columns and that each row
-    contains either HOURLYSALARY or MONTHLYSALARY, but not both
-    (a non-zero value in both columns is an error).
+def _is_zero_salary(value: str) -> bool:
+    """Return True if the salary string represents zero / empty."""
+    return value in ("", ".00", "0", "0.00")
 
-    Returns parsed rows as list[dict].
+
+def _format_salary(value: str) -> str:
+    """Format a salary value to 2 decimals, or return empty if zero."""
+    if _is_zero_salary(value):
+        return ""
+    try:
+        d = Decimal(value).quantize(Decimal("0.01"))
+        return str(d)
+    except InvalidOperation:
+        return value  # pass through; row-level validation will catch truly bad data
+
+
+def _first_of_month(date_str: str) -> str:
+    """Parse 'YYYY-MM-DD HH:MM:SS' (or 'YYYY-MM-DD') and return '01-MM-YYYY'."""
+    date_part = date_str.split(" ")[0] if " " in date_str else date_str
+    dt = datetime.strptime(date_part, "%Y-%m-%d")
+    return dt.replace(day=1).strftime("%d-%m-%Y")
+
+
+def validate_and_transform_csv(
+    raw: bytes, filename: str
+) -> tuple[list[str], list[str]]:
+    """
+    Validate the CSV header, then validate each row individually.
+
+    Row-level checks (skip & log on failure):
+      - EMPLID must be present
+      - SOCIALSECURITYNUM must be present
+      - Must have HOURLYSALARY *or* MONTHLYSALARY, not both and not neither
+
+    Returns:
+        (output_lines, row_errors)
+        output_lines - transformed lines ready for the output file
+        row_errors   - human-readable error strings for skipped rows
     """
     try:
         text = raw.decode("utf-8-sig")  # handles BOM if present
@@ -200,7 +232,7 @@ def validate_csv(raw: bytes, filename: str) -> list[dict]:
 
     reader = csv.DictReader(io.StringIO(text))
 
-    # --- Column check ---
+    # --- Column check (file-level) ---
     if reader.fieldnames is None:
         raise ValueError(f"{filename}: CSV file is empty or has no header row.")
 
@@ -212,64 +244,59 @@ def validate_csv(raw: bytes, filename: str) -> list[dict]:
             f"  Got:      {actual}"
         )
 
-    rows: list[dict] = []
+    output_lines: list[str] = []
+    row_errors: list[str] = []
+
     for line_no, row in enumerate(reader, start=2):
+        row = {k: v.strip() for k, v in row.items()}
+
+        emplid = row.get("EMPLID", "").strip()
+        ssn = row.get("SOCIALSECURITYNUM", "").strip()
         hourly = row.get("HOURLYSALARY", "").strip()
         monthly = row.get("MONTHLYSALARY", "").strip()
+        hours = row.get("HOURSPERWEEK", "").strip()
+        raw_date = row.get("FIRSTREPETITIONDATE", "").strip()
 
-        hourly_has_value = hourly not in ("", ".00", "0", "0.00")
-        monthly_has_value = monthly not in ("", ".00", "0", "0.00")
+        hourly_has_value = not _is_zero_salary(hourly)
+        monthly_has_value = not _is_zero_salary(monthly)
 
+        # ── Row-level validation ──
+        errors: list[str] = []
+        if not emplid or not emplid.isdigit() or int(emplid) <= 0:
+            errors.append(f"invalid EMPLID ({emplid!r})")
+        if not ssn or not ssn.isdigit() or int(ssn) <= 0:
+            errors.append(f"invalid SOCIALSECURITYNUM ({ssn!r})")
         if hourly_has_value and monthly_has_value:
-            raise ValueError(
-                f"{filename} line {line_no}: Row has both HOURLYSALARY ({hourly}) "
-                f"and MONTHLYSALARY ({monthly}). Only one is allowed."
+            errors.append(
+                f"has both HOURLYSALARY ({hourly}) and MONTHLYSALARY ({monthly})"
             )
+        if not hourly_has_value and not monthly_has_value:
+            errors.append("has neither HOURLYSALARY nor MONTHLYSALARY")
 
-        rows.append({k: v.strip() for k, v in row.items()})
+        if errors:
+            msg = f"{filename} line {line_no}: {'; '.join(errors)}"
+            log.warning("Skipping row: %s", msg)
+            row_errors.append(msg)
+            continue
 
-    if not rows:
-        raise ValueError(f"{filename}: CSV file contains a header but no data rows.")
-
-    return rows
-
-
-def transform_value(value: str) -> str:
-    """Clean up a single field value."""
-    if value in (".00", "0.00", "0"):
-        return ""
-    return value
-
-
-def transform_date(date_str: str) -> str:
-    """Convert 'YYYY-MM-DD HH:MM:SS' → 'YYYY-MM-DD'."""
-    return date_str.split(" ")[0] if " " in date_str else date_str
-
-
-def transform_csv(rows: list[dict]) -> str:
-    """
-    Transform validated rows into the target format:
-    - No header
-    - Fields enclosed in double-quotes
-    - Semicolon separated
-    - .00 values → empty
-    - Date truncated to YYYY-MM-DD
-    """
-    output_lines: list[str] = []
-    for row in rows:
-        emplid = transform_value(row["EMPLID"])
-        date = transform_date(row["FIRSTREPETITIONDATE"])
-        hourly = transform_value(row["HOURLYSALARY"])
-        hours = transform_value(row["HOURSPERWEEK"])
-        monthly = transform_value(row["MONTHLYSALARY"])
-        ssn = transform_value(row["SOCIALSECURITYNUM"])
-
+        # ── Transform ──
         line = ";".join(
-            f'"{v}"' for v in [emplid, date, hourly, hours, monthly, ssn]
+            f'"{v}"'
+            for v in [
+                emplid,
+                _first_of_month(raw_date),
+                _format_salary(hourly),
+                _format_salary(hours) if not _is_zero_salary(hours) else "",
+                _format_salary(monthly),
+                ssn,
+            ]
         )
         output_lines.append(line)
 
-    return "\n".join(output_lines) + "\n"
+    if not output_lines and not row_errors:
+        raise ValueError(f"{filename}: CSV file contains a header but no data rows.")
+
+    return output_lines, row_errors
 
 
 # ──────────────────────────────────────────────
@@ -297,53 +324,50 @@ def upload_to_sftp(content: bytes) -> None:
 # Archival helpers
 # ──────────────────────────────────────────────
 def _timestamp_folder_name() -> str:
-    """Return a folder name like '12-02-2026 14.35.07'."""
-    return datetime.now(timezone.utc).strftime("%d-%m-%Y %H.%M.%S")
-
-
-def archive_success(
-    token: str, drive_id: str, item_id: str, filename: str
-) -> None:
-    """Move the original file into  Behandlet/<timestamp>/."""
-    ts = _timestamp_folder_name()
-    base = SHAREPOINT_FOLDER_PATH
-    behandlet_path = f"{base}/Behandlet"
-    dest_path = f"{behandlet_path}/{ts}"
-
-    create_sharepoint_folder(token, drive_id, behandlet_path, ts)
-    move_file(token, drive_id, item_id, dest_path)
-    log.info("Archived %s → Behandlet/%s/", filename, ts)
+    """Return a folder name like '12-02-2026 14.35'."""
+    return datetime.now(timezone.utc).strftime("%d-%m-%Y %H.%M")
 
 
 def archive_failure(
-    token: str, drive_id: str, item_id: str, filename: str, error_log: str
+    token: str, drive_id: str, item_id: str, filename: str, error_log: str,
+    feil_dest_path: str,
 ) -> None:
-    """Move the original file + a log file into  Feil/<timestamp>/."""
-    ts = _timestamp_folder_name()
-    base = SHAREPOINT_FOLDER_PATH
-    feil_path = f"{base}/Feil"
-    dest_path = f"{feil_path}/{ts}"
-
-    create_sharepoint_folder(token, drive_id, feil_path, ts)
+    """Move the original file + a log file into the run's Feil/<timestamp>/ folder."""
+    # Ensure the Feil timestamp folder exists (created lazily)
+    feil_parent = "/".join(feil_dest_path.rsplit("/", 1)[:-1])
+    feil_folder_name = feil_dest_path.rsplit("/", 1)[-1]
+    create_sharepoint_folder(token, drive_id, feil_parent, feil_folder_name)
 
     # Upload the error log into the timestamped folder
     log_filename = f"{os.path.splitext(filename)[0]}_error.log"
     upload_file_to_sharepoint(
-        token, drive_id, dest_path, log_filename, error_log.encode("utf-8")
+        token, drive_id, feil_dest_path, log_filename, error_log.encode("utf-8")
     )
 
     # Move the original file alongside the log
-    move_file(token, drive_id, item_id, dest_path)
-    log.info("Archived %s → Feil/%s/  (with error log)", filename, ts)
+    move_file(token, drive_id, item_id, feil_dest_path)
+    log.info("Archived %s → Feil/  (with error log)", filename)
 
 
 # ──────────────────────────────────────────────
 # Main orchestration
 # ──────────────────────────────────────────────
 def process_file(
-    token: str, drive_id: str, item: dict
-) -> None:
-    """Validate, transform, upload, and archive a single CSV file."""
+    token: str, drive_id: str, item: dict,
+    behandlet_dest_path: str, feil_dest_path: str,
+) -> tuple[list[str], list[str]]:
+    """
+    Validate & transform a single CSV file.
+
+    Returns:
+        (output_lines, row_errors)
+        output_lines – transformed lines (may be empty if whole file failed)
+        row_errors   – list of error messages for this file
+
+    Side-effects:
+        - Archives file to behandlet_dest_path on success (even partial)
+        - Archives file + error log to feil_dest_path on total failure
+    """
     filename: str = item["name"]
     item_id: str = item["id"]
     log.info("Processing file: %s", filename)
@@ -352,36 +376,62 @@ def process_file(
         # 1. Download from SharePoint
         raw = download_file(token, drive_id, item_id)
 
-        # 2. Validate
-        rows = validate_csv(raw, filename)
+        # 2. Validate & transform (row-level)
+        output_lines, row_errors = validate_and_transform_csv(raw, filename)
 
-        # 3. Transform
-        output = transform_csv(rows)
-        output_bytes = output.encode("utf-8")
+        if row_errors:
+            log.warning(
+                "%s: %d row(s) skipped due to validation errors.",
+                filename,
+                len(row_errors),
+            )
 
-        # 4. Upload to SFTP
-        upload_to_sftp(output_bytes)
+        if not output_lines:
+            # Every single row failed → treat as full failure
+            raise ValueError(
+                f"All rows failed validation:\n" + "\n".join(row_errors)
+            )
 
-        # 5. Archive original file → Behandlet/<timestamp>/
-        archive_success(token, drive_id, item_id, filename)
+        # 3. Archive original → Behandlet/<timestamp>/
+        #    (includes a row-error log if there were partial failures)
+        if row_errors:
+            error_log_name = f"{os.path.splitext(filename)[0]}_skipped_rows.log"
+            error_log_content = (
+                f"File: {filename}\n"
+                f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+                f"Skipped {len(row_errors)} row(s):\n\n"
+                + "\n".join(row_errors)
+                + "\n"
+            )
+            upload_file_to_sharepoint(
+                token, drive_id, behandlet_dest_path, error_log_name,
+                error_log_content.encode("utf-8"),
+            )
 
-        log.info("Successfully processed %s", filename)
+        move_file(token, drive_id, item_id, behandlet_dest_path)
+        log.info(
+            "Archived %s → Behandlet/  (%d valid rows, %d skipped)",
+            filename, len(output_lines), len(row_errors),
+        )
+        return output_lines, row_errors
 
     except Exception as exc:
         error_msg = f"Error processing {filename}: {exc}"
         log.error(error_msg, exc_info=True)
 
-        # Build a detailed error log
+        file_error = f"{filename}: {exc}"
+
         error_log = (
             f"File: {filename}\n"
             f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
             f"Error: {exc}\n"
         )
-
         try:
-            archive_failure(token, drive_id, item_id, filename, error_log)
+            archive_failure(token, drive_id, item_id, filename, error_log, feil_dest_path)
         except Exception as archive_exc:
             log.error("Failed to archive error files: %s", archive_exc, exc_info=True)
+
+        return [], [file_error]
 
 
 def main() -> None:
@@ -430,10 +480,39 @@ def main() -> None:
 
     log.info("Found %d CSV file(s) to process.", len(csv_files))
 
-    # 4. Process each CSV file one-by-one
-    for item in csv_files:
-        process_file(token, drive_id, item)
+    # 4. Create a single timestamped folder for this run
+    ts = _timestamp_folder_name()
+    base = SHAREPOINT_FOLDER_PATH
 
+    behandlet_path = f"{base}/Behandlet"
+    behandlet_dest = f"{behandlet_path}/{ts}"
+    create_sharepoint_folder(token, drive_id, behandlet_path, ts)
+
+    feil_path = f"{base}/Feil"
+    feil_dest = f"{feil_path}/{ts}"
+    # Feil folder is created lazily – only when a file actually fails
+
+    log.info("Run folder: %s", ts)
+
+    # 5. Process each CSV – collect all valid output lines
+    all_output_lines: list[str] = []
+    for item in csv_files:
+        lines, _file_errors = process_file(token, drive_id, item, behandlet_dest, feil_dest)
+        all_output_lines.extend(lines)
+
+    if not all_output_lines:
+        log.warning("No valid output rows from any file. Skipping SFTP upload.")
+        return
+
+    # 6. Merge into a single output and upload to SFTP
+    merged_output = "\n".join(all_output_lines) + "\n"
+    upload_to_sftp(merged_output.encode("utf-8"))
+
+    log.info(
+        "Uploaded %d total rows to SFTP as %s",
+        len(all_output_lines),
+        OUTPUT_FILENAME,
+    )
     log.info("=== UTIL-Employee-TP-Import finished ===")
 
 
